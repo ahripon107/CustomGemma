@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Training artifacts / logs
+checkpoints-fineweb/
+wandb/
