@@ -1,32 +1,26 @@
-"""Pretrain the ~0.95B text-only Gemma-4 model (see train_hf.py) on nvidia/Nemotron-CC-v2
-via HF Trainer.
+"""Pretrain the ~0.95B text-only Gemma-4 model on nvidia/Nemotron-CC-v2 via HF Trainer.
+
+Model surgery / warm-start lives in ``model_prep.py``; the streaming data pipeline
+and the benchmark eval corpora live in ``data_prep.py``. This file is just the
+training loop, the WSD schedule, the token-accounting callback, and the in-loop
+benchmark callback.
 
 Run from inside gemma/:
-    python train_fineweb.py            # fresh run
-    python train_fineweb.py --resume   # continue from ./checkpoints-fineweb
+    python train_nvidia_cc.py            # fresh run
+    python train_nvidia_cc.py --resume   # continue from ./checkpoints-fineweb
 
-Needs HF_TOKEN (with access to the gated nvidia/Nemotron-CC-v2 dataset) in ../.env or .env.
+Needs HF_TOKEN (gated dataset + tokenizer/weights) and, optionally, WANDB_API_KEY
+in ../.env or .env.
 """
 
 import argparse
-import gc
 import math
 import os
-from itertools import chain, islice
 
 import torch
 import wandb
-from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
-from huggingface_hub import hf_hub_download
-from safetensors import safe_open
-
-load_dotenv()  # HF_TOKEN for the gated dataset + tokenizer/weights; WANDB_API_KEY for logging
-HF_TOKEN = os.environ.get("HF_TOKEN")
 from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
     Trainer,
     TrainerCallback,
     TrainingArguments,
@@ -35,22 +29,18 @@ from transformers import (
 )
 from transformers.integrations import WandbCallback
 
+from model_prep import CONTEXT_LEN, NUM_LAYERS, REF_MODEL, WARM_START, build_model, load_tokenizer
+from data_prep import DATASET, DATASET_CONFIG, SEED, build_eval_corpora, build_train_dataset
+
+load_dotenv()  # WANDB_API_KEY for logging (HF_TOKEN is read by model_prep / data_prep)
+
 # --------------------------------------------------------------------------- #
 # Knobs
 # --------------------------------------------------------------------------- #
-REF_MODEL      = "google/gemma-4-E2B"       # tokenizer + warm-start weights
-DATASET        = "nvidia/Nemotron-CC-v2"    # gated; needs HF_TOKEN access
-DATASET_CONFIG = "High-Quality"             # or High-Quality-Synthetic / Medium-High-Quality
-                                            # / Medium-Quality / Diverse-QA / Translated-Diverse-QA
-CONTEXT_LEN    = 2048
-SEED           = 1234
-
 OUTPUT_DIR     = "./checkpoints-fineweb"
-WARM_START     = True                       # init from E2B text weights (100% at 15 layers)
-NUM_LAYERS     = 15
 
-MICRO_BATCH    = 10                          # per-device
-GRAD_ACCUM     = 4                         # -> effective 8*16*2048 = 262k tokens/step (1 GPU)
+MICRO_BATCH    = 10                         # per-device
+GRAD_ACCUM     = 4                          # -> effective 10*4*2048 = 82k tokens/step (1 GPU)
 MAX_STEPS      = 20_000
 WARMUP_STEPS   = 500
 PEAK_LR        = 3e-4
@@ -65,20 +55,10 @@ DECAY_STEPS    = 3_000
 WANDB_PROJECT  = "pretrain-gemma-4-0.95b"
 
 # Benchmark suite: run every EVAL_STEPS optimizer steps (blocking, rank 0 only).
-#   1. WikiText perplexity        (held-out public corpus; the wikitext-2 val set
-#      is only ~139 packed seqs, so we probe a larger slice of the
-#      wikitext-103-raw-v1 *train* split instead -- still disjoint from the
-#      Nemotron-CC training data)
-#   2. Nemotron-CC-v2 val loss/ppl (VAL_DOCS docs skipped from the head of the
-#      train stream, so train and val are disjoint)
-#   3. HellaSwag acc / acc_norm    (length-normalised loglikelihood; HELLASWAG_N
-#      examples of the val split, or None for the full 10 042-example split)
-EVAL_STEPS     = 1_000
-EVAL_MAX_SEQS  = 200                        # packed CONTEXT_LEN-token seqs, Nemotron held-out
-WIKITEXT_MAX_SEQS = 600                     # packed CONTEXT_LEN-token seqs, WikiText probe (~1.2M tok)
-EVAL_BATCH     = 8                          # seqs per forward for the LM-loss evals
-VAL_DOCS       = 2_000
-HELLASWAG_N    = None                       # None -> full validation split (10 042 examples)
+# The corpora themselves are built in data_prep.build_eval_corpora; these knobs
+# only control how the in-loop scoring runs.
+EVAL_STEPS      = 1_000
+EVAL_BATCH      = 8                         # seqs per forward for the LM-loss evals
 HELLASWAG_BATCH = 32                        # (example, ending) rows per forward
 
 
@@ -107,53 +87,8 @@ class TokensSeenCallback(TrainerCallback):
 
 
 # --------------------------------------------------------------------------- #
-# Benchmark eval
+# Benchmark scoring
 # --------------------------------------------------------------------------- #
-def _pack_texts(tokenizer, texts, max_seqs):
-    """Concatenate `texts`, tokenize, and cut into non-overlapping CONTEXT_LEN
-    blocks (same packing as the training loader). Returns a Dataset of input_ids."""
-    ids = []
-    for t in texts:
-        if not t or not t.strip():
-            continue
-        ids.extend(tokenizer(t, truncation=True, max_length=2 * CONTEXT_LEN)["input_ids"])
-        if len(ids) >= (max_seqs + 1) * CONTEXT_LEN:
-            break
-    n = (len(ids) // CONTEXT_LEN) * CONTEXT_LEN
-    chunks = [ids[i : i + CONTEXT_LEN] for i in range(0, n, CONTEXT_LEN)][:max_seqs]
-    return Dataset.from_dict({"input_ids": chunks})
-
-
-def build_eval_corpora(tokenizer):
-    """WikiText + held-out Nemotron packed LM sets, and the HellaSwag examples."""
-    wt = load_dataset(
-        "Salesforce/wikitext", "wikitext-103-raw-v1", split="train", streaming=True
-    )
-    wikitext_ds = _pack_texts(
-        tokenizer, (ex["text"] for ex in wt), WIKITEXT_MAX_SEQS
-    )
-
-    raw = load_dataset(
-        DATASET, name=DATASET_CONFIG, split="train", streaming=True, token=HF_TOKEN
-    )
-    held = [ex["text"] for ex in islice(raw, VAL_DOCS)]
-    nemotron_ds = _pack_texts(tokenizer, held, EVAL_MAX_SEQS)
-
-    hs = load_dataset("Rowan/hellaswag", split="validation")
-    if HELLASWAG_N:
-        hs = hs.select(range(min(HELLASWAG_N, len(hs))))
-    hellaswag = [
-        {"ctx": e["ctx"], "endings": e["endings"], "label": int(e["label"])}
-        for e in hs
-        if e["label"] != ""
-    ]
-    print(
-        f"eval corpora: wikitext {len(wikitext_ds)} seqs | "
-        f"nemotron-heldout {len(nemotron_ds)} seqs | hellaswag {len(hellaswag)} ex"
-    )
-    return wikitext_ds, nemotron_ds, hellaswag
-
-
 @torch.no_grad()
 def _lm_loss(model, packed_ds, device, batch_size):
     """Mean token cross-entropy over a packed LM dataset (teacher forcing)."""
@@ -238,87 +173,17 @@ class BenchmarkCallback(TrainerCallback):
         )
 
 
-def build_config():
-    d = {
-        "model_type": "gemma4_text",
-        "vocab_size": 262144,
-        "hidden_size": 1536,
-        "intermediate_size": 6144,
-        "num_hidden_layers": NUM_LAYERS,
-        "num_attention_heads": 8,
-        "num_key_value_heads": 1,
-        "head_dim": 256,
-        "hidden_size_per_layer_input": 0,          # no Per-Layer Embeddings
-        "max_position_embeddings": max(CONTEXT_LEN, 8192),
-        "rms_norm_eps": 1e-6,
-        "tie_word_embeddings": True,
-        "attention_dropout": 0.0,
-        "layer_types": [
-            "full_attention" if (i + 1) % 5 == 0 else "sliding_attention"
-            for i in range(NUM_LAYERS)
-        ],
-    }
-    return AutoConfig.for_model(**d)
-
-
-def warm_start_from_e2b(model):
-    own = model.state_dict()
-    loadable = {}
-    path = hf_hub_download(REF_MODEL, "model.safetensors", token=HF_TOKEN)
-    with safe_open(path, framework="pt") as f:
-        for src_key in f.keys():
-            if "language_model" not in src_key:
-                continue
-            key = src_key.replace("model.language_model.", "model.", 1)
-            if key in own and tuple(f.get_slice(src_key).get_shape()) == tuple(own[key].shape):
-                loadable[key] = f.get_tensor(src_key).to(own[key].dtype)
-    model.load_state_dict(loadable, strict=False)
-    model.tie_weights()
-    n = len(loadable)
-    del loadable
-    gc.collect()
-    return n
-
-
-def build_dataset(tokenizer):
-    ds = load_dataset(
-        DATASET, name=DATASET_CONFIG, split="train", streaming=True, token=HF_TOKEN
-    )
-    ds = ds.skip(VAL_DOCS)                         # reserve the head for the Nemotron held-out eval
-    ds = ds.shuffle(seed=SEED, buffer_size=100)   # prefilled into RAM before the first batch; keep small
-    cols = list(ds.features)
-
-    def tokenize(batch):
-        # adds BOS per doc; cap long docs so the packing buffers below stay small
-        return {"input_ids": tokenizer(batch["text"], truncation=True, max_length=2 * CONTEXT_LEN)["input_ids"]}
-
-    def pack(batch):
-        ids = list(chain.from_iterable(batch["input_ids"]))
-        n = (len(ids) // CONTEXT_LEN) * CONTEXT_LEN
-        chunks = [ids[i : i + CONTEXT_LEN] for i in range(0, n, CONTEXT_LEN)]
-        return {"input_ids": chunks, "labels": [c[:] for c in chunks]}
-
-    # small map batches: default 1000 makes pack() build ~16M-int Python lists on
-    # the main process and thrashes host RAM. 128 keeps the transient spike tiny.
-    ds = ds.map(tokenize, batched=True, batch_size=128, remove_columns=cols)
-    ds = ds.map(pack, batched=True, batch_size=128, remove_columns=["input_ids"])
-    return ds
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
     set_seed(SEED)
-    tokenizer = AutoTokenizer.from_pretrained(REF_MODEL, token=HF_TOKEN)
+    tokenizer = load_tokenizer()
 
-    model = AutoModelForCausalLM.from_config(build_config())
-    if WARM_START:
-        print(f"warm-started {warm_start_from_e2b(model)} tensors from {REF_MODEL}")
-    model.config.use_cache = False               # needed for gradient checkpointing
+    model = build_model(warm_start=WARM_START)
 
-    train_ds = build_dataset(tokenizer)
+    train_ds = build_train_dataset(tokenizer)
     wikitext_ds, nemotron_ds, hellaswag = build_eval_corpora(tokenizer)
 
     # wandb: one resumable run per OUTPUT_DIR. The Qwen scripts stash wandb_run_id

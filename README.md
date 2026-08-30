@@ -6,7 +6,13 @@ text‑only decoder**, warm‑starts the small model from the surviving E2B weig
 and **pretrains** it on the gated **`nvidia/Nemotron-CC-v2`** corpus with the
 Hugging Face `Trainer`.
 
-Everything lives in one script: [`train_nvidia_cc.py`](train_nvidia_cc.py).
+The code is split into three files:
+
+| File | Role |
+| ---- | ---- |
+| [`model_prep.py`](model_prep.py) | architectural surgery — builds the `gemma4_text` config and warm‑starts from E2B (`build_config`, `warm_start_from_e2b`, `build_model`, `load_tokenizer`). Run standalone (`python model_prep.py`) to materialise an init checkpoint. |
+| [`data_prep.py`](data_prep.py) | the streaming train pipeline (`build_train_dataset`) and the benchmark eval corpora (`build_eval_corpora`). Run standalone (`python data_prep.py --peek` / `--eval-cache DIR`) to sanity‑check or cache. |
+| [`train_nvidia_cc.py`](train_nvidia_cc.py) | the training loop only — WSD schedule, `TokensSeenCallback`, `BenchmarkCallback`, and the W&B resumable‑run plumbing. Imports the two above. |
 
 ---
 
@@ -28,7 +34,7 @@ mechanism. The bulk of its parameters are **not** in the transformer stack:
 ### What `build_config()` changes
 
 The custom model is declared as a plain **`gemma4_text`** config (see
-`build_config()` in `train_nvidia_cc.py`):
+`build_config()` in `model_prep.py`):
 
 | Knob                          | E2B (`text_config`) | This model | Effect |
 | ----------------------------- | ------------------- | ---------- | ------ |
@@ -128,10 +134,10 @@ without a shape/name match) keep their fresh init.
 
 | Setting                          | Value |
 | -------------------------------- | ----- |
-| `per_device_train_batch_size`    | 8 |
-| `gradient_accumulation_steps`    | 4 |
-| effective batch                  | 8 × 4 × 2048 = **65,536 tokens / optimizer step** (single GPU) |
-| `max_steps`                      | **20,000**  → ≈ **1.3 B tokens** total |
+| `per_device_train_batch_size`    | 10 (`MICRO_BATCH`) |
+| `gradient_accumulation_steps`    | 4 (`GRAD_ACCUM`) |
+| effective batch                  | 10 × 4 × 2048 = **81,920 tokens / optimizer step** (single GPU) |
+| `max_steps`                      | **20,000**  → ≈ **1.6 B tokens** total |
 | optimizer                        | AdamW, β = (0.9, 0.95), `weight_decay = 0.1` |
 | grad clip                        | `max_grad_norm = 1.0` |
 | peak LR                          | **3e‑4** |
@@ -139,18 +145,18 @@ without a shape/name match) keep their fresh init.
 | &nbsp;&nbsp;• warmup             | 500 steps (linear 0 → peak) |
 | &nbsp;&nbsp;• stable             | 16,500 steps (hold at peak) |
 | &nbsp;&nbsp;• decay              | final **3,000** steps, cosine to `0.1 × peak` = 3e‑5 |
-| checkpoints                      | every 250 steps, keep last 3 (`save_total_limit=3`) |
+| checkpoints                      | every 500 steps, keep last 10 (`save_total_limit=10`) |
 | logging                          | every 10 steps |
 | dataloader workers               | 0 (>0 duplicates the whole stream per worker) |
 
-> **Note:** the inline comment near `GRAD_ACCUM` still reads `8*16*2048 = 262k
-> tokens/step` from an earlier configuration. The live values are
-> `GRAD_ACCUM = 4` → **65,536 tokens/step**, and `run_hparams`
-> (`effective_tokens_per_step`) logs that figure to W&B.
+`run_hparams["effective_tokens_per_step"]` (= `MICRO_BATCH * GRAD_ACCUM *
+CONTEXT_LEN`) logs the 81,920 figure to W&B.
 
 ### In‑loop evaluation — `BenchmarkCallback`
 
-Every `EVAL_STEPS = 1000` optimizer steps, on rank 0, blocking:
+The three corpora are built once by `data_prep.build_eval_corpora()`; the
+callback (in `train_nvidia_cc.py`) scores them every `EVAL_STEPS = 1000`
+optimizer steps, on rank 0, blocking:
 
 1. **WikiText** (`Salesforce/wikitext`, `wikitext-103-raw-v1`) — the `wikitext-2`
    validation set is only ~139 packed 2048‑token blocks, so the probe streams the
@@ -232,10 +238,19 @@ WikiText‑2 blocks and 1000 HellaSwag examples.)
 
 ```bash
 # fresh run — surgery + warm-start + pretrain
+# (train_nvidia_cc.py imports model_prep + data_prep; no separate step needed)
 python train_nvidia_cc.py
 
 # resume from the latest checkpoint in ./checkpoints-fineweb
 python train_nvidia_cc.py --resume
+```
+
+The prep files also run standalone for inspection:
+
+```bash
+python model_prep.py --save-dir ./gemma4-15L-init   # write an initialised checkpoint
+python data_prep.py --peek                          # pull one packed training example
+python data_prep.py --eval-cache ./eval-corpora     # cache the finite eval sets
 ```
 
 On resume, `ignore_data_skip=True` means the streaming loader does **not** replay
