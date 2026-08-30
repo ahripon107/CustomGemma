@@ -55,11 +55,17 @@ DECAY_STEPS    = 3_000
 WANDB_PROJECT  = "pretrain-gemma-4-0.95b"
 
 # Benchmark suite: run every EVAL_STEPS optimizer steps (blocking, rank 0 only).
-# The corpora themselves are built in data_prep.build_eval_corpora; these knobs
-# only control how the in-loop scoring runs.
-EVAL_STEPS      = 1_000
-EVAL_BATCH      = 8                         # seqs per forward for the LM-loss evals
-HELLASWAG_BATCH = 32                        # (example, ending) rows per forward
+#   * WikiText + Nemotron held-out  -> loss / perplexity  (_lm_loss)
+#   * HellaSwag, PIQA, ARC-Challenge, WinoGrande, MMLU -> accuracy  (_mc_acc)
+# The corpora / example sets are built in data_prep.build_eval_corpora (with the
+# per-task size knobs there); these knobs only control the in-loop scoring.
+EVAL_STEPS = 1_000
+EVAL_BATCH = 8                              # seqs per forward for the LM-loss evals
+MC_BATCH   = 32                             # (example, choice) rows per forward for the MC evals
+
+# multiple-choice tasks that also get an acc_norm (length-normalised) metric;
+# WinoGrande / MMLU score a fixed-length continuation so acc_norm == acc there.
+MC_NORM_TASKS = {"hellaswag", "piqa", "arc_challenge"}
 
 
 class TokensSeenCallback(TrainerCallback):
@@ -104,18 +110,25 @@ def _lm_loss(model, packed_ds, device, batch_size):
 
 
 @torch.no_grad()
-def _hellaswag_acc(model, tokenizer, examples, device, batch_size):
-    """Length-normalised loglikelihood scoring -> (acc, acc_norm)."""
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    rows = []                                    # (ex_idx, ending_idx, ctx_len, full_ids)
-    for ei, ex in enumerate(examples):
-        ctx_ids = tokenizer(ex["ctx"])["input_ids"]
-        for k, end in enumerate(ex["endings"]):
-            full_ids = tokenizer(ex["ctx"] + " " + end)["input_ids"]
-            rows.append((ei, k, len(ctx_ids), full_ids))
+def _mc_acc(model, tokenizer, examples, device, batch_size):
+    """Multiple-choice scoring by continuation loglikelihood -> (acc, acc_norm).
 
-    ll = torch.full((len(examples), 4), float("-inf"))
-    ll_norm = torch.full((len(examples), 4), float("-inf"))
+    Each example is ``{"pairs": [(context, continuation), ...], "gold": int}``.
+    The continuation tokens are scored given their context; the prediction is the
+    argmax over summed LL (``acc``) and per-token mean LL (``acc_norm``). Choice
+    counts may vary between examples (ARC) -- unused slots stay at -inf."""
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    n_choices = max(len(ex["pairs"]) for ex in examples)
+    rows = []                                    # (ex_idx, choice_idx, ctx_len, full_ids)
+    for ei, ex in enumerate(examples):
+        for k, (ctx, cont) in enumerate(ex["pairs"]):
+            ctx_ids = tokenizer(ctx)["input_ids"]
+            full_ids = tokenizer(ctx + cont)["input_ids"]
+            clen = min(len(ctx_ids), len(full_ids) - 1)   # keep >=1 target token
+            rows.append((ei, k, clen, full_ids))
+
+    ll = torch.full((len(examples), n_choices), float("-inf"))
+    ll_norm = torch.full((len(examples), n_choices), float("-inf"))
     for i in range(0, len(rows), batch_size):
         chunk = rows[i : i + batch_size]
         maxlen = max(len(f) for *_, f in chunk)
@@ -132,22 +145,24 @@ def _hellaswag_acc(model, tokenizer, examples, device, batch_size):
             lp = logp[j, clen - 1 : len(f) - 1, :].gather(-1, tgt[:, None]).squeeze(-1)
             ll[ei, k] = lp.sum().item()
             ll_norm[ei, k] = lp.mean().item()
-    labels = torch.tensor([ex["label"] for ex in examples])
+    gold = torch.tensor([ex["gold"] for ex in examples])
     return (
-        (ll.argmax(-1) == labels).float().mean().item(),
-        (ll_norm.argmax(-1) == labels).float().mean().item(),
+        (ll.argmax(-1) == gold).float().mean().item(),
+        (ll_norm.argmax(-1) == gold).float().mean().item(),
     )
 
 
 class BenchmarkCallback(TrainerCallback):
-    """Every EVAL_STEPS steps: WikiText + Nemotron perplexity and HellaSwag
-    accuracy, logged to wandb against train/global_step (rank 0, blocking)."""
+    """Every EVAL_STEPS steps: WikiText + Nemotron perplexity and the
+    multiple-choice accuracy benchmarks (HellaSwag, PIQA, ARC-Challenge,
+    WinoGrande, MMLU), logged to wandb against train/global_step (rank 0,
+    blocking)."""
 
-    def __init__(self, tokenizer, wikitext_ds, nemotron_ds, hellaswag):
+    def __init__(self, tokenizer, wikitext_ds, nemotron_ds, mc_tasks):
         self.tok = tokenizer
         self.wikitext_ds = wikitext_ds
         self.nemotron_ds = nemotron_ds
-        self.hellaswag = hellaswag
+        self.mc_tasks = mc_tasks
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if state.global_step == 0 or state.global_step % EVAL_STEPS != 0:
@@ -161,9 +176,11 @@ class BenchmarkCallback(TrainerCallback):
             loss = _lm_loss(model, ds, args.device, EVAL_BATCH)
             m[f"eval/{name}_loss"] = loss
             m[f"eval/{name}_ppl"] = math.exp(loss)
-        acc, acc_norm = _hellaswag_acc(model, self.tok, self.hellaswag, args.device, HELLASWAG_BATCH)
-        m["eval/hellaswag_acc"] = acc
-        m["eval/hellaswag_acc_norm"] = acc_norm
+        for task, examples in self.mc_tasks.items():
+            acc, acc_norm = _mc_acc(model, self.tok, examples, args.device, MC_BATCH)
+            m[f"eval/{task}_acc"] = acc
+            if task in MC_NORM_TASKS:
+                m[f"eval/{task}_acc_norm"] = acc_norm
         if was_training:
             model.train()
         wandb.log({**m, "train/global_step": state.global_step}, step=state.global_step)
@@ -184,7 +201,7 @@ def main():
     model = build_model(warm_start=WARM_START)
 
     train_ds = build_train_dataset(tokenizer)
-    wikitext_ds, nemotron_ds, hellaswag = build_eval_corpora(tokenizer)
+    wikitext_ds, nemotron_ds, mc_tasks = build_eval_corpora(tokenizer)
 
     # wandb: one resumable run per OUTPUT_DIR. The Qwen scripts stash wandb_run_id
     # in the checkpoint; HF Trainer checkpoints don't carry custom keys, so persist
@@ -272,7 +289,7 @@ def main():
     w_idx = next(i for i, c in enumerate(cbs) if isinstance(c, WandbCallback))
     cbs.insert(w_idx, TokensSeenCallback(CONTEXT_LEN))
 
-    trainer.add_callback(BenchmarkCallback(tokenizer, wikitext_ds, nemotron_ds, hellaswag))
+    trainer.add_callback(BenchmarkCallback(tokenizer, wikitext_ds, nemotron_ds, mc_tasks))
 
     trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model(OUTPUT_DIR)

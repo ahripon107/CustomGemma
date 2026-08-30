@@ -154,21 +154,42 @@ CONTEXT_LEN`) logs the 81,920 figure to W&B.
 
 ### In‑loop evaluation — `BenchmarkCallback`
 
-The three corpora are built once by `data_prep.build_eval_corpora()`; the
-callback (in `train_nvidia_cc.py`) scores them every `EVAL_STEPS = 1000`
-optimizer steps, on rank 0, blocking:
+The corpora / example sets are built once by `data_prep.build_eval_corpora()`;
+the callback (in `train_nvidia_cc.py`) scores them every `EVAL_STEPS = 1000`
+optimizer steps, on rank 0, blocking.
+
+**Perplexity** (`_lm_loss`, teacher forcing over packed 2048‑token blocks):
 
 1. **WikiText** (`Salesforce/wikitext`, `wikitext-103-raw-v1`) — the `wikitext-2`
-   validation set is only ~139 packed 2048‑token blocks, so the probe streams the
+   validation set is only ~139 packed blocks, so the probe streams the
    `wikitext-103-raw-v1` **train** split and packs the first
    `WIKITEXT_MAX_SEQS = 600` blocks (~1.2 M tokens), still disjoint from the
    Nemotron‑CC training data → loss + perplexity.
 2. **Nemotron‑CC‑v2 held‑out** — the 2000 skipped docs, packed to
    `EVAL_MAX_SEQS = 200` blocks → loss + perplexity (a true in‑distribution val
    signal).
-3. **HellaSwag** (`Rowan/hellaswag`, full 10,042‑example val split;
-   `HELLASWAG_N = None`) — length‑normalised log‑likelihood scoring → `acc` and
-   `acc_norm`.
+
+**Multiple‑choice accuracy** (`_mc_acc`, 0‑shot, lm‑eval‑harness prompt
+formatting; each candidate scored by the continuation log‑likelihood given its
+context, argmax over summed LL → `acc` and per‑token‑mean LL → `acc_norm`). Every
+task defaults to its full split (`*_N = None`); set the knob in `data_prep.py` to
+subsample.
+
+| Task | Source | Split | `acc_norm`? |
+| ---- | ------ | ----- | ----------- |
+| **HellaSwag** | `Rowan/hellaswag` | validation, 10,042 | yes |
+| **PIQA** | `ybisk/piqa` (`refs/convert/parquet`) | validation, 1,838 | yes |
+| **ARC‑Challenge** | `allenai/ai2_arc`, `ARC-Challenge` | test, 1,172 | yes |
+| **WinoGrande** | `coref-data/winogrande_raw`, `winogrande_xl` | validation, 1,267 | n/a (fixed‑length target) |
+| **MMLU** | `cais/mmlu`, `all` | test, 14,042 | n/a (single‑letter target) |
+
+> MMLU is by far the largest (14,042 × 4 candidates); it roughly doubles the
+> in‑loop eval time. Drop `MMLU_N` to e.g. `3000` (shuffled, so all 57 subjects
+> stay represented) if that matters.
+>
+> `coref-data/winogrande_raw` is used because the official `allenai/winogrande`
+> is a dataset script (unsupported on `datasets` 5.x) and its parquet export
+> concatenates every size config.
 
 `TokensSeenCallback` injects `train/tokens_seen` (derived cheaply from
 `global_step × effective_batch × seq_len`) into every log record, slotted just

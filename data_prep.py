@@ -45,10 +45,18 @@ DATASET_CONFIG = "High-Quality"             # or High-Quality-Synthetic / Medium
 SEED           = 1234
 VAL_DOCS       = 2_000                      # head of the train stream reserved for the Nemotron eval
 
-# eval-corpora sizes (packed CONTEXT_LEN-token seqs, except HELLASWAG_N)
+# LM-perplexity corpora sizes (packed CONTEXT_LEN-token seqs)
 EVAL_MAX_SEQS     = 200                     # Nemotron held-out
 WIKITEXT_MAX_SEQS = 600                     # WikiText probe (~1.2M tok)
-HELLASWAG_N       = None                    # None -> full validation split (10 042 examples)
+
+# multiple-choice benchmark sizes -- None means the whole split. MMLU is the big
+# one (14 042 examples x 4 choices); set MMLU_N to subsample (shuffled, so every
+# subject is represented) if the in-loop eval gets too slow.
+HELLASWAG_N      = None                     # validation, 10 042 ex
+PIQA_N           = None                     # validation, 1 838 ex
+ARC_N            = None                     # ARC-Challenge test, 1 172 ex
+WINOGRANDE_N     = None                     # winogrande_xl validation, 1 267 ex
+MMLU_N           = None                     # test, 14 042 ex
 
 
 # --------------------------------------------------------------------------- #
@@ -97,8 +105,104 @@ def _pack_texts(tokenizer, texts, max_seqs):
     return Dataset.from_dict({"input_ids": chunks})
 
 
+# --------------------------------------------------------------------------- #
+# Multiple-choice benchmarks
+#
+# Each builder returns a list of {"pairs": [(context, continuation), ...],
+# "gold": int}. The trainer scores the continuation tokens of every pair (summed
+# and length-normalised loglikelihood) and takes the argmax -- see _mc_acc in
+# train_nvidia_cc.py. Prompt formatting follows lm-eval-harness (0-shot).
+# --------------------------------------------------------------------------- #
+def _subsample(ds, n):
+    if n and n < len(ds):
+        ds = ds.shuffle(seed=SEED).select(range(n))
+    return ds
+
+
+def _hellaswag_examples():
+    ds = _subsample(load_dataset("Rowan/hellaswag", split="validation"), HELLASWAG_N)
+    return [
+        {"pairs": [(e["ctx"], " " + end) for end in e["endings"]], "gold": int(e["label"])}
+        for e in ds
+        if e["label"] != ""
+    ]
+
+
+def _piqa_examples():
+    ds = _subsample(
+        load_dataset("ybisk/piqa", split="validation", revision="refs/convert/parquet"),
+        PIQA_N,
+    )
+    out = []
+    for e in ds:
+        if e["label"] not in (0, 1):
+            continue
+        ctx = f"Question: {e['goal']}\nAnswer:"
+        out.append({"pairs": [(ctx, " " + e["sol1"]), (ctx, " " + e["sol2"])], "gold": e["label"]})
+    return out
+
+
+def _arc_examples():
+    ds = _subsample(
+        load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test"), ARC_N
+    )
+    out = []
+    for e in ds:
+        labels, texts = e["choices"]["label"], e["choices"]["text"]
+        if e["answerKey"] not in labels:
+            continue
+        ctx = f"Question: {e['question']}\nAnswer:"
+        out.append({"pairs": [(ctx, " " + t) for t in texts], "gold": labels.index(e["answerKey"])})
+    return out
+
+
+def _winogrande_examples():
+    # official allenai/winogrande is script-only (unsupported on datasets 5.x) and
+    # its parquet export merges every size config; this mirror is the plain xl set.
+    ds = _subsample(
+        load_dataset("coref-data/winogrande_raw", "winogrande_xl", split="validation"),
+        WINOGRANDE_N,
+    )
+    out = []
+    for e in ds:
+        idx = e["sentence"].index("_")
+        prefix, suffix = e["sentence"][:idx], e["sentence"][idx + 1 :].strip()
+        pairs = [(prefix + e["option1"], " " + suffix), (prefix + e["option2"], " " + suffix)]
+        out.append({"pairs": pairs, "gold": int(e["answer"]) - 1})
+    return out
+
+
+def _mmlu_examples():
+    ds = _subsample(load_dataset("cais/mmlu", "all", split="test"), MMLU_N)
+    letters = ["A", "B", "C", "D"]
+    out = []
+    for e in ds:
+        subject = e["subject"].replace("_", " ")
+        opts = "\n".join(f"{l}. {c}" for l, c in zip(letters, e["choices"]))
+        ctx = (
+            f"The following are multiple choice questions (with answers) about {subject}.\n\n"
+            f"{e['question'].strip()}\n{opts}\nAnswer:"
+        )
+        out.append({"pairs": [(ctx, f" {l}") for l in letters], "gold": int(e["answer"])})
+    return out
+
+
+MC_BUILDERS = {
+    "hellaswag": _hellaswag_examples,
+    "piqa": _piqa_examples,
+    "arc_challenge": _arc_examples,
+    "winogrande": _winogrande_examples,
+    "mmlu": _mmlu_examples,
+}
+
+
 def build_eval_corpora(tokenizer):
-    """WikiText + held-out Nemotron packed LM sets, and the HellaSwag examples."""
+    """Returns (wikitext_ds, nemotron_ds, mc_tasks).
+
+    wikitext_ds / nemotron_ds are packed LM sets for perplexity; mc_tasks is
+    {task_name: [example, ...]} for the multiple-choice accuracy benchmarks
+    (HellaSwag, PIQA, ARC-Challenge, WinoGrande, MMLU).
+    """
     wt = load_dataset(
         "Salesforce/wikitext", "wikitext-103-raw-v1", split="train", streaming=True
     )
@@ -112,19 +216,14 @@ def build_eval_corpora(tokenizer):
     held = [ex["text"] for ex in islice(raw, VAL_DOCS)]
     nemotron_ds = _pack_texts(tokenizer, held, EVAL_MAX_SEQS)
 
-    hs = load_dataset("Rowan/hellaswag", split="validation")
-    if HELLASWAG_N:
-        hs = hs.select(range(min(HELLASWAG_N, len(hs))))
-    hellaswag = [
-        {"ctx": e["ctx"], "endings": e["endings"], "label": int(e["label"])}
-        for e in hs
-        if e["label"] != ""
-    ]
+    mc_tasks = {name: build() for name, build in MC_BUILDERS.items()}
+
     print(
         f"eval corpora: wikitext {len(wikitext_ds)} seqs | "
-        f"nemotron-heldout {len(nemotron_ds)} seqs | hellaswag {len(hellaswag)} ex"
+        f"nemotron-heldout {len(nemotron_ds)} seqs | "
+        + " | ".join(f"{k} {len(v)} ex" for k, v in mc_tasks.items())
     )
-    return wikitext_ds, nemotron_ds, hellaswag
+    return wikitext_ds, nemotron_ds, mc_tasks
 
 
 def main():
