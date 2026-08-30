@@ -1,29 +1,3 @@
-"""Dataset preparation for the nvidia/Nemotron-CC-v2 pretraining run.
-
-Provides two builders the trainer imports:
-
-  * ``build_train_dataset(tokenizer)`` -> streaming ``IterableDataset`` of packed,
-    non-overlapping ``CONTEXT_LEN``-token blocks (one BOS per doc, ``labels`` set).
-    The first ``VAL_DOCS`` docs are ``.skip()``-ped so train / val stay disjoint.
-
-  * ``build_eval_corpora(tokenizer)`` -> ``(wikitext_ds, nemotron_ds, hellaswag)``
-    for the in-loop benchmark suite:
-      - WikiText  : the wikitext-2 val set is only ~139 packed blocks, so we probe
-        a larger slice of the wikitext-103-raw-v1 *train* split instead
-        (``WIKITEXT_MAX_SEQS`` blocks, ~1.2M tokens), still disjoint from Nemotron.
-      - Nemotron  : the ``VAL_DOCS`` skipped docs, packed to ``EVAL_MAX_SEQS`` blocks
-        (a true in-distribution val signal).
-      - HellaSwag : ``HELLASWAG_N`` val examples, or None for the full 10 042.
-
-Standalone, to sanity-check the pipeline and optionally cache the (finite) eval
-corpora to disk:
-    python data_prep.py --peek
-    python data_prep.py --eval-cache ./eval-corpora
-
-Needs HF_TOKEN (with access to the gated nvidia/Nemotron-CC-v2 dataset) in
-../.env or .env.
-"""
-
 import argparse
 import os
 from itertools import chain, islice
@@ -36,22 +10,15 @@ from model_prep import CONTEXT_LEN, load_tokenizer
 load_dotenv()  # HF_TOKEN for the gated dataset
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-# --------------------------------------------------------------------------- #
-# Knobs
-# --------------------------------------------------------------------------- #
 DATASET        = "nvidia/Nemotron-CC-v2"    # gated; needs HF_TOKEN access
 DATASET_CONFIG = "High-Quality"             # or High-Quality-Synthetic / Medium-High-Quality
                                             # / Medium-Quality / Diverse-QA / Translated-Diverse-QA
 SEED           = 1234
 VAL_DOCS       = 2_000                      # head of the train stream reserved for the Nemotron eval
 
-# LM-perplexity corpora sizes (packed CONTEXT_LEN-token seqs)
 EVAL_MAX_SEQS     = 200                     # Nemotron held-out
 WIKITEXT_MAX_SEQS = 600                     # WikiText probe (~1.2M tok)
 
-# multiple-choice benchmark sizes -- None means the whole split. MMLU is the big
-# one (14 042 examples x 4 choices); set MMLU_N to subsample (shuffled, so every
-# subject is represented) if the in-loop eval gets too slow.
 HELLASWAG_N      = None                     # validation, 10 042 ex
 PIQA_N           = None                     # validation, 1 838 ex
 ARC_N            = None                     # ARC-Challenge test, 1 172 ex
@@ -59,9 +26,6 @@ WINOGRANDE_N     = None                     # winogrande_xl validation, 1 267 ex
 MMLU_N           = None                     # test, 14 042 ex
 
 
-# --------------------------------------------------------------------------- #
-# Training stream
-# --------------------------------------------------------------------------- #
 def build_train_dataset(tokenizer):
     ds = load_dataset(
         DATASET, name=DATASET_CONFIG, split="train", streaming=True, token=HF_TOKEN
@@ -80,16 +44,11 @@ def build_train_dataset(tokenizer):
         chunks = [ids[i : i + CONTEXT_LEN] for i in range(0, n, CONTEXT_LEN)]
         return {"input_ids": chunks, "labels": [c[:] for c in chunks]}
 
-    # small map batches: default 1000 makes pack() build ~16M-int Python lists on
-    # the main process and thrashes host RAM. 128 keeps the transient spike tiny.
     ds = ds.map(tokenize, batched=True, batch_size=128, remove_columns=cols)
     ds = ds.map(pack, batched=True, batch_size=128, remove_columns=["input_ids"])
     return ds
 
 
-# --------------------------------------------------------------------------- #
-# Benchmark eval corpora
-# --------------------------------------------------------------------------- #
 def _pack_texts(tokenizer, texts, max_seqs):
     """Concatenate `texts`, tokenize, and cut into non-overlapping CONTEXT_LEN
     blocks (same packing as the training loader). Returns a Dataset of input_ids."""
@@ -197,12 +156,6 @@ MC_BUILDERS = {
 
 
 def build_eval_corpora(tokenizer):
-    """Returns (wikitext_ds, nemotron_ds, mc_tasks).
-
-    wikitext_ds / nemotron_ds are packed LM sets for perplexity; mc_tasks is
-    {task_name: [example, ...]} for the multiple-choice accuracy benchmarks
-    (HellaSwag, PIQA, ARC-Challenge, WinoGrande, MMLU).
-    """
     wt = load_dataset(
         "Salesforce/wikitext", "wikitext-103-raw-v1", split="train", streaming=True
     )

@@ -1,20 +1,3 @@
-"""Model preparation for the ~0.95B text-only Gemma-4.
-
-Architectural surgery on ``google/gemma-4-E2B``: declare a 15-layer, PLE-free,
-text-only ``gemma4_text`` config and warm-start every surviving tensor from the
-E2B text tower (token embedding, final norm, and layers 0-14 transfer verbatim;
-the Per-Layer-Embedding table and layers 15-34 are dropped).
-
-Imported by the trainer:
-    from model_prep import build_model, load_tokenizer
-    model = build_model()                 # config + warm-start, ready for Trainer
-
-Standalone, to materialise an init checkpoint for inspection:
-    python model_prep.py --save-dir ./gemma4-15L-init
-
-Needs HF_TOKEN (with access to google/gemma-4-E2B) in ../.env or .env.
-"""
-
 import argparse
 import gc
 import os
@@ -27,13 +10,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 load_dotenv()  # HF_TOKEN for the gated tokenizer/weights
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-# --------------------------------------------------------------------------- #
-# Knobs
-# --------------------------------------------------------------------------- #
-REF_MODEL   = "google/gemma-4-E2B"     # tokenizer + warm-start weights
-CONTEXT_LEN = 2048                     # training seq len; also sets max_position_embeddings
+REF_MODEL   = "google/gemma-4-E2B"
+CONTEXT_LEN = 2048
 NUM_LAYERS  = 15
-WARM_START  = True                     # init from E2B text weights (100% at 15 layers)
+WARM_START  = True
 
 
 def build_config():
@@ -83,10 +63,6 @@ def load_tokenizer():
 
 
 def build_model(warm_start=WARM_START):
-    """Instantiate the custom config and (optionally) warm-start from E2B.
-
-    Returns a model with ``use_cache`` disabled, ready for gradient checkpointing.
-    """
     model = AutoModelForCausalLM.from_config(build_config())
     if warm_start:
         print(f"warm-started {warm_start_from_e2b(model)} tensors from {REF_MODEL}")

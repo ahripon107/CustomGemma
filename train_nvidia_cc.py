@@ -37,18 +37,13 @@ load_dotenv()  # WANDB_API_KEY for logging (HF_TOKEN is read by model_prep / dat
 # --------------------------------------------------------------------------- #
 # Knobs
 # --------------------------------------------------------------------------- #
-OUTPUT_DIR     = "./checkpoints-fineweb"
+OUTPUT_DIR     = "./checkpoints-nemotron"
 
 MICRO_BATCH    = 10                         # per-device
 GRAD_ACCUM     = 4                          # -> effective 10*4*2048 = 82k tokens/step (1 GPU)
 MAX_STEPS      = 20_000
 WARMUP_STEPS   = 500
-PEAK_LR        = 3e-4
-
-# WSD (warmup-stable-decay) LR schedule, matching the Qwen pretrain scripts:
-# linear warmup -> hold at PEAK_LR -> cosine decay to MIN_LR_RATIO * PEAK_LR over
-# the final DECAY_STEPS. warmup + stable + decay must sum to MAX_STEPS
-# (stable = 20_000 - 500 - 3_000 = 16_500).
+PEAK_LR        = 3e-5
 MIN_LR_RATIO   = 0.1
 DECAY_STEPS    = 3_000
 
@@ -63,20 +58,10 @@ EVAL_STEPS = 1_000
 EVAL_BATCH = 8                              # seqs per forward for the LM-loss evals
 MC_BATCH   = 32                             # (example, choice) rows per forward for the MC evals
 
-# multiple-choice tasks that also get an acc_norm (length-normalised) metric;
-# WinoGrande / MMLU score a fixed-length continuation so acc_norm == acc there.
 MC_NORM_TASKS = {"hellaswag", "piqa", "arc_challenge"}
 
 
 class TokensSeenCallback(TrainerCallback):
-    """Add train/tokens_seen to every log record, like the Qwen pretrain scripts.
-
-    Derived from the optimizer-step count (global_step * effective batch * seq_len),
-    so it costs nothing -- unlike TrainingArguments.include_num_input_tokens_seen,
-    which does an all-gather + .item() sync every step. Inserted just ahead of
-    Trainer's WandbCallback so the key rides the normal wandb report and gets the
-    `train/` prefix from rewrite_logs().
-    """
 
     def __init__(self, seq_len):
         self.seq_len = seq_len
@@ -92,9 +77,6 @@ class TokensSeenCallback(TrainerCallback):
             )
 
 
-# --------------------------------------------------------------------------- #
-# Benchmark scoring
-# --------------------------------------------------------------------------- #
 @torch.no_grad()
 def _lm_loss(model, packed_ds, device, batch_size):
     """Mean token cross-entropy over a packed LM dataset (teacher forcing)."""
@@ -111,12 +93,6 @@ def _lm_loss(model, packed_ds, device, batch_size):
 
 @torch.no_grad()
 def _mc_acc(model, tokenizer, examples, device, batch_size):
-    """Multiple-choice scoring by continuation loglikelihood -> (acc, acc_norm).
-
-    Each example is ``{"pairs": [(context, continuation), ...], "gold": int}``.
-    The continuation tokens are scored given their context; the prediction is the
-    argmax over summed LL (``acc``) and per-token mean LL (``acc_norm``). Choice
-    counts may vary between examples (ARC) -- unused slots stay at -inf."""
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     n_choices = max(len(ex["pairs"]) for ex in examples)
     rows = []                                    # (ex_idx, choice_idx, ctx_len, full_ids)
@@ -153,10 +129,6 @@ def _mc_acc(model, tokenizer, examples, device, batch_size):
 
 
 class BenchmarkCallback(TrainerCallback):
-    """Every EVAL_STEPS steps: WikiText + Nemotron perplexity and the
-    multiple-choice accuracy benchmarks (HellaSwag, PIQA, ARC-Challenge,
-    WinoGrande, MMLU), logged to wandb against train/global_step (rank 0,
-    blocking)."""
 
     def __init__(self, tokenizer, wikitext_ds, nemotron_ds, mc_tasks):
         self.tok = tokenizer
@@ -203,10 +175,6 @@ def main():
     train_ds = build_train_dataset(tokenizer)
     wikitext_ds, nemotron_ds, mc_tasks = build_eval_corpora(tokenizer)
 
-    # wandb: one resumable run per OUTPUT_DIR. The Qwen scripts stash wandb_run_id
-    # in the checkpoint; HF Trainer checkpoints don't carry custom keys, so persist
-    # it next to them instead. Init before the Trainer so its WandbCallback reuses
-    # this run (and just merges TrainingArguments + model config into it).
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     id_path = os.path.join(OUTPUT_DIR, "wandb_run_id.txt")
     resuming_run = args.resume and os.path.exists(id_path)
@@ -242,7 +210,6 @@ def main():
         name=f"gemma4-{NUM_LAYERS}L-{MAX_STEPS}steps",
     )
 
-    # plot every EVAL_STEPS benchmark metric against the optimizer step
     wandb.define_metric("train/global_step")
     wandb.define_metric("eval/*", step_metric="train/global_step")
 
@@ -282,9 +249,6 @@ def main():
         data_collator=default_data_collator,      # labels already set in pack()
     )
 
-    # slot TokensSeenCallback right before WandbCallback so it can inject
-    # tokens_seen into `logs` before wandb reads it (user callbacks are otherwise
-    # appended after the integration callbacks).
     cbs = trainer.callback_handler.callbacks
     w_idx = next(i for i, c in enumerate(cbs) if isinstance(c, WandbCallback))
     cbs.insert(w_idx, TokensSeenCallback(CONTEXT_LEN))
