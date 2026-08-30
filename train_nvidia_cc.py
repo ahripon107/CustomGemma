@@ -49,7 +49,7 @@ OUTPUT_DIR     = "./checkpoints-fineweb"
 WARM_START     = True                       # init from E2B text weights (100% at 15 layers)
 NUM_LAYERS     = 15
 
-MICRO_BATCH    = 8                          # per-device
+MICRO_BATCH    = 10                          # per-device
 GRAD_ACCUM     = 4                         # -> effective 8*16*2048 = 262k tokens/step (1 GPU)
 MAX_STEPS      = 20_000
 WARMUP_STEPS   = 500
@@ -65,16 +65,20 @@ DECAY_STEPS    = 3_000
 WANDB_PROJECT  = "pretrain-gemma-4-0.95b"
 
 # Benchmark suite: run every EVAL_STEPS optimizer steps (blocking, rank 0 only).
-#   1. WikiText perplexity        (held-out public corpus; wt2 == wt103 val set)
+#   1. WikiText perplexity        (held-out public corpus; the wikitext-2 val set
+#      is only ~139 packed seqs, so we probe a larger slice of the
+#      wikitext-103-raw-v1 *train* split instead -- still disjoint from the
+#      Nemotron-CC training data)
 #   2. Nemotron-CC-v2 val loss/ppl (VAL_DOCS docs skipped from the head of the
 #      train stream, so train and val are disjoint)
-#   3. HellaSwag acc / acc_norm    (length-normalised loglikelihood, HELLASWAG_N
-#      examples of the 10 042-example val split)
+#   3. HellaSwag acc / acc_norm    (length-normalised loglikelihood; HELLASWAG_N
+#      examples of the val split, or None for the full 10 042-example split)
 EVAL_STEPS     = 1_000
-EVAL_MAX_SEQS  = 200                        # packed CONTEXT_LEN-token seqs per LM corpus
+EVAL_MAX_SEQS  = 200                        # packed CONTEXT_LEN-token seqs, Nemotron held-out
+WIKITEXT_MAX_SEQS = 600                     # packed CONTEXT_LEN-token seqs, WikiText probe (~1.2M tok)
 EVAL_BATCH     = 8                          # seqs per forward for the LM-loss evals
 VAL_DOCS       = 2_000
-HELLASWAG_N    = 1_000
+HELLASWAG_N    = None                       # None -> full validation split (10 042 examples)
 HELLASWAG_BATCH = 32                        # (example, ending) rows per forward
 
 
@@ -122,8 +126,12 @@ def _pack_texts(tokenizer, texts, max_seqs):
 
 def build_eval_corpora(tokenizer):
     """WikiText + held-out Nemotron packed LM sets, and the HellaSwag examples."""
-    wt = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="validation")
-    wikitext_ds = _pack_texts(tokenizer, wt["text"], EVAL_MAX_SEQS)
+    wt = load_dataset(
+        "Salesforce/wikitext", "wikitext-103-raw-v1", split="train", streaming=True
+    )
+    wikitext_ds = _pack_texts(
+        tokenizer, (ex["text"] for ex in wt), WIKITEXT_MAX_SEQS
+    )
 
     raw = load_dataset(
         DATASET, name=DATASET_CONFIG, split="train", streaming=True, token=HF_TOKEN
@@ -132,7 +140,8 @@ def build_eval_corpora(tokenizer):
     nemotron_ds = _pack_texts(tokenizer, held, EVAL_MAX_SEQS)
 
     hs = load_dataset("Rowan/hellaswag", split="validation")
-    hs = hs.select(range(min(HELLASWAG_N, len(hs))))
+    if HELLASWAG_N:
+        hs = hs.select(range(min(HELLASWAG_N, len(hs))))
     hellaswag = [
         {"ctx": e["ctx"], "endings": e["endings"], "label": int(e["label"])}
         for e in hs
@@ -222,7 +231,7 @@ class BenchmarkCallback(TrainerCallback):
         m["eval/hellaswag_acc_norm"] = acc_norm
         if was_training:
             model.train()
-        wandb.log({**m, "train/global_step": state.global_step})
+        wandb.log({**m, "train/global_step": state.global_step}, step=state.global_step)
         print(
             f"[bench @ {state.global_step}] "
             + " | ".join(f"{k.split('/')[1]} {v:.4f}" for k, v in m.items())
@@ -351,6 +360,10 @@ def main():
         name=f"gemma4-{NUM_LAYERS}L-{MAX_STEPS}steps",
     )
 
+    # plot every EVAL_STEPS benchmark metric against the optimizer step
+    wandb.define_metric("train/global_step")
+    wandb.define_metric("eval/*", step_metric="train/global_step")
+
     targs = TrainingArguments(
         output_dir=OUTPUT_DIR,
         max_steps=MAX_STEPS,                      # required: streaming dataset has no length
@@ -371,8 +384,8 @@ def main():
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=10,
-        save_steps=250,
-        save_total_limit=3,
+        save_steps=500,
+        save_total_limit=10,
         dataloader_num_workers=0,                # >0 duplicates the whole stream per worker
         dataloader_pin_memory=False,             # page-locked host RAM, no gain for tiny streaming batches
         report_to=["wandb"],                     # matches the Qwen pretrain scripts

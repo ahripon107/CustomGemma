@@ -152,12 +152,17 @@ without a shape/name match) keep their fresh init.
 
 Every `EVAL_STEPS = 1000` optimizer steps, on rank 0, blocking:
 
-1. **WikiText‑2‑raw** (`Salesforce/wikitext`, validation) — packed 2048‑token
-   blocks, up to 200 seqs → loss + perplexity.
-2. **Nemotron‑CC‑v2 held‑out** — the 2000 skipped docs, same packing → loss +
-   perplexity (a true in‑distribution val signal).
-3. **HellaSwag** (`Rowan/hellaswag`, first 1000 of 10,042 val examples) —
-   length‑normalised log‑likelihood scoring → `acc` and `acc_norm`.
+1. **WikiText** (`Salesforce/wikitext`, `wikitext-103-raw-v1`) — the `wikitext-2`
+   validation set is only ~139 packed 2048‑token blocks, so the probe streams the
+   `wikitext-103-raw-v1` **train** split and packs the first
+   `WIKITEXT_MAX_SEQS = 600` blocks (~1.2 M tokens), still disjoint from the
+   Nemotron‑CC training data → loss + perplexity.
+2. **Nemotron‑CC‑v2 held‑out** — the 2000 skipped docs, packed to
+   `EVAL_MAX_SEQS = 200` blocks → loss + perplexity (a true in‑distribution val
+   signal).
+3. **HellaSwag** (`Rowan/hellaswag`, full 10,042‑example val split;
+   `HELLASWAG_N = None`) — length‑normalised log‑likelihood scoring → `acc` and
+   `acc_norm`.
 
 `TokensSeenCallback` injects `train/tokens_seen` (derived cheaply from
 `global_step × effective_batch × seq_len`) into every log record, slotted just
@@ -177,8 +182,10 @@ ahead of the W&B callback.
 ## 3. Training curves
 
 Metrics logged to Weights & Biases for the `gemma4-15L-20000steps` run. Training
-signals are logged every 10 steps; the WikiText‑2 / HellaSwag eval points are
-produced every `EVAL_STEPS = 1000` optimizer steps by `BenchmarkCallback`.
+signals are logged every 10 steps; the WikiText / HellaSwag eval points are
+produced every `EVAL_STEPS = 1000` optimizer steps by `BenchmarkCallback`. (The
+curves below are from an earlier run that used the smaller eval sizes — 200
+WikiText‑2 blocks and 1000 HellaSwag examples.)
 
 ### Optimization
 
@@ -194,14 +201,16 @@ produced every `EVAL_STEPS = 1000` optimizer steps by `BenchmarkCallback`.
 
 ### Held‑out evaluation
 
-| WikiText‑2 loss | WikiText‑2 perplexity | HellaSwag accuracy |
-| --------------- | --------------------- | ------------------ |
-| ![WikiText-2 loss](graphs/wikitext-loss.png) | ![WikiText-2 perplexity](graphs/wikitext-perplexity.png) | ![HellaSwag accuracy](graphs/hellaswag-accuracy.png) |
+| WikiText loss | WikiText perplexity | HellaSwag accuracy |
+| ------------- | ------------------- | ------------------ |
+| ![WikiText loss](graphs/wikitext-loss.png) | ![WikiText perplexity](graphs/wikitext-perplexity.png) | ![HellaSwag accuracy](graphs/hellaswag-accuracy.png) |
 
-- **WikiText‑2‑raw** (`Salesforce/wikitext`, validation) — packed 2048‑token
-  blocks, up to 200 sequences → loss and perplexity.
-- **HellaSwag** (`Rowan/hellaswag`, first 1000 val examples) — length‑normalised
-  log‑likelihood scoring (`acc` / `acc_norm`).
+- **WikiText** (`Salesforce/wikitext`) — packed 2048‑token blocks → loss and
+  perplexity. Now a 600‑block (~1.2 M token) slice of the `wikitext-103-raw-v1`
+  train split; the plotted run used 200 blocks of the `wikitext-2` validation set.
+- **HellaSwag** (`Rowan/hellaswag`) — length‑normalised log‑likelihood scoring
+  (`acc` / `acc_norm`). Now the full 10,042‑example validation split; the plotted
+  run used the first 1000.
 
 ---
 
