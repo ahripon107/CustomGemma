@@ -174,7 +174,38 @@ ahead of the W&B callback.
 
 ---
 
-## 3. Running it
+## 3. Training curves
+
+Metrics logged to Weights & Biases for the `gemma4-15L-20000steps` run. Training
+signals are logged every 10 steps; the WikiText‑2 / HellaSwag eval points are
+produced every `EVAL_STEPS = 1000` optimizer steps by `BenchmarkCallback`.
+
+### Optimization
+
+| Training loss | Learning rate (WSD) | Gradient norm |
+| ------------- | ------------------- | ------------- |
+| ![Training loss](graphs/training-loss.png) | ![Learning rate](graphs/lr.png) | ![Gradient norm](graphs/grad_norm.png) |
+
+- **Training loss** — full‑block causal‑LM loss on packed 2048‑token
+  Nemotron‑CC‑v2 blocks.
+- **Learning rate** — 500‑step linear warmup to the 3e‑4 peak, held stable, then
+  cosine‑decayed to 3e‑5 over the final 3,000 steps.
+- **Gradient norm** — pre‑clip global grad norm (`max_grad_norm = 1.0`).
+
+### Held‑out evaluation
+
+| WikiText‑2 loss | WikiText‑2 perplexity | HellaSwag accuracy |
+| --------------- | --------------------- | ------------------ |
+| ![WikiText-2 loss](graphs/wikitext-loss.png) | ![WikiText-2 perplexity](graphs/wikitext-perplexity.png) | ![HellaSwag accuracy](graphs/hellaswag-accuracy.png) |
+
+- **WikiText‑2‑raw** (`Salesforce/wikitext`, validation) — packed 2048‑token
+  blocks, up to 200 sequences → loss and perplexity.
+- **HellaSwag** (`Rowan/hellaswag`, first 1000 val examples) — length‑normalised
+  log‑likelihood scoring (`acc` / `acc_norm`).
+
+---
+
+## 4. Running it
 
 ### Prerequisites
 
@@ -217,7 +248,7 @@ stream, which is the intended behaviour for an effectively infinite corpus.
 
 ---
 
-## 4. Architecture summary
+## 5. Architecture summary
 
 ```
 Gemma4ForCausalLM (model_type = "gemma4_text")
