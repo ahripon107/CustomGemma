@@ -13,5 +13,7 @@ __pycache__/
 *$py.class
 
 # Training artifacts / logs
-checkpoints-fineweb/
+checkpoints-*/
+gemma4-15L-init/
+eval-corpora/
 wandb/

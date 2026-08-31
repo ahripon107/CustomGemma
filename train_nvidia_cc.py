@@ -17,6 +17,8 @@ import argparse
 import math
 import os
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import wandb
 from dotenv import load_dotenv
@@ -55,8 +57,8 @@ WANDB_PROJECT  = "pretrain-gemma-4-0.95b"
 # The corpora / example sets are built in data_prep.build_eval_corpora (with the
 # per-task size knobs there); these knobs only control the in-loop scoring.
 EVAL_STEPS = 1_000
-EVAL_BATCH = 8                              # seqs per forward for the LM-loss evals
-MC_BATCH   = 32                             # (example, choice) rows per forward for the MC evals
+EVAL_BATCH = 4                              # 2048-tok seqs per forward for the LM-loss evals
+MC_BATCH   = 8                              # (example, choice) rows per forward for the MC evals
 
 MC_NORM_TASKS = {"hellaswag", "piqa", "arc_challenge"}
 
@@ -115,12 +117,16 @@ def _mc_acc(model, tokenizer, examples, device, batch_size):
             attn[j, : len(f)] = 1
         inp, attn = inp.to(device), attn.to(device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logp = torch.log_softmax(model(input_ids=inp, attention_mask=attn).logits.float(), dim=-1)
+            logits = model(input_ids=inp, attention_mask=attn).logits      # [B, T, V] bf16
         for j, (ei, k, clen, f) in enumerate(chunk):
+            # only the continuation positions need a full-vocab softmax; doing it
+            # over all T at V=262k is what OOMs (a [B, T, V] float32 tensor).
+            sl = logits[j, clen - 1 : len(f) - 1].float()                  # [C, V], C = few
             tgt = torch.tensor(f[clen:], device=device)
-            lp = logp[j, clen - 1 : len(f) - 1, :].gather(-1, tgt[:, None]).squeeze(-1)
+            lp = torch.log_softmax(sl, dim=-1).gather(-1, tgt[:, None]).squeeze(-1)
             ll[ei, k] = lp.sum().item()
             ll_norm[ei, k] = lp.mean().item()
+        del logits
     gold = torch.tensor([ex["gold"] for ex in examples])
     return (
         (ll.argmax(-1) == gold).float().mean().item(),
@@ -143,6 +149,8 @@ class BenchmarkCallback(TrainerCallback):
             return
         was_training = model.training
         model.eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()          # hand the training step's cached blocks back
         m = {}
         for name, ds in (("wikitext", self.wikitext_ds), ("nemotron", self.nemotron_ds)):
             loss = _lm_loss(model, ds, args.device, EVAL_BATCH)
@@ -155,6 +163,8 @@ class BenchmarkCallback(TrainerCallback):
                 m[f"eval/{task}_acc_norm"] = acc_norm
         if was_training:
             model.train()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         wandb.log({**m, "train/global_step": state.global_step}, step=state.global_step)
         print(
             f"[bench @ {state.global_step}] "
